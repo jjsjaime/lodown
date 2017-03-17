@@ -78,10 +78,13 @@ lodown_mtps <-
 
         x <- utils::read.csv( this_data_file , sep = ";" , dec = "," , header = TRUE )
 
-        suppressWarnings( unlink( paste0( tempdir() , "\\unzipped" ) , recursive = TRUE ) )
+        file.remove( this_data_file )
 
         # convert all column names to lowercase
         names( x ) <- tolower( names( x ) )
+
+        # remove accents
+        names( x ) <- iconv( names( x ) , to = "ASCII//TRANSLIT" )
 
         # add underscores after monetdb illegal names
         for ( j in names( x )[ toupper( names( x ) ) %in% getFromNamespace( "reserved_monetdb_keywords" , "MonetDBLite" ) ] ) names( x )[ names( x ) == j ] <- paste0( j , "_" )
@@ -105,6 +108,14 @@ lodown_mtps <-
 
         }
 
+        # remove accents and special characters from character columns
+        # figure out which columns really ought to be numeric
+        x[ , sapply( x, typeof ) == "character" ] <-
+          apply( x[ , sapply( x, typeof ) == "character" ] , 2 , function( column ) {
+            column = iconv( column , to = "ASCII//TRANSLIT" )
+            gsub( "\\{" , "" , column )
+          } )
+
         catalog[ i , 'case_count' ] <- nrow( x )
 
         saveRDS( x , file = catalog[ i , 'output_filename' ] )
@@ -113,7 +124,7 @@ lodown_mtps <-
 
         these_cols <- data.frame( col_name = names( these_cols ) , col_type = these_cols , stringsAsFactors = FALSE )
 
-        if( exists( catalog[ i , 'db_tablename' ] ) ){
+        if( exists( catalog[ i , 'db_tablename' ] ) ) {
 
           same_table_cols <- get( catalog[ i , 'db_tablename' ] )
           same_table_cols <- unique( rbind( these_cols , same_table_cols ) )
