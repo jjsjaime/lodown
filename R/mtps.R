@@ -23,10 +23,8 @@ get_catalog_mtps <-
     catalog$subtype[ catalog$type == "rais" ] <-
       ifelse( grepl( "estb" , catalog$full_url[ catalog$type == "rais" ] , ignore.case = TRUE ) , "estabelecimento" , "vinculo" )
 
-    catalog$output_filename <- gsub( "7z$|zip$" , "rds" ,
-                                                gsub( "ftp://ftp.mtps.gov.br/pdet/microdados/" , paste0( output_dir , "/" ) , tolower( catalog$full_url ) ) ,
-                                                ignore.case = TRUE )
-    catalog$output_filename <- sapply( catalog$output_filename , utils::URLdecode )
+    catalog$output_filename <- ifelse( grepl( "7z$|zip$" , catalog$full_url , ignore.case = TRUE ) , NA ,
+                                     paste0( output_dir , "/" , basename( tolower( catalog$full_url ) ) ) )
 
     catalog$year <- NULL
     catalog$year [ catalog$type %in% c( "caged" , "rais" ) ] <- as.numeric( gsub( ".*/" , "" , dirname( catalog$full_url ) )[ catalog$type %in% c( "caged" , "rais" ) ] )
@@ -67,6 +65,8 @@ lodown_mtps <-
 
       } else {
 
+        db <- DBI::dbConnect( MonetDBLite::MonetDBLite() , catalog[ i , 'dbfolder' ] )
+
         # build the string to send to DOS
         dos.command <- paste0( '"' , normalizePath( path_to_7z ) , '" x "' , normalizePath( tf ) , '" -o"' , paste0( tempdir() , "\\unzipped" ) , '"' )
 
@@ -76,129 +76,79 @@ lodown_mtps <-
 
         this_data_file <- grep( "\\.csv|\\.txt$", this_data_file, value = TRUE, ignore.case = TRUE )
 
-        x <- utils::read.csv( this_data_file , sep = ";" , dec = "," , header = TRUE )
+        cleaned_data_file <- standardize_mtps( this_data_file )
+
+        num_cols <- length( readLines( cleaned_data_file , 1 )[[1]] )
 
         file.remove( this_data_file )
 
-        # convert all column names to lowercase
-        names( x ) <- tolower( names( x ) )
+        suppressMessages(
+          DBI::dbWriteTable(
+            db,
+            catalog[ i , 'db_tablename' ],
+            cleaned_data_file ,
+            sep = ";" ,
+            header = TRUE ,
+            lower.case.names = TRUE ,
+            #nrow.check = 50000 ,
+            colClasses = rep( "character" , num_cols ) ,
+            append = TRUE
+          ) )
 
-        # remove accents
-        names( x ) <- iconv( names( x ) , to = "ASCII//TRANSLIT" )
-
-        # add underscores after monetdb illegal names
-        for ( j in names( x )[ toupper( names( x ) ) %in% getFromNamespace( "reserved_monetdb_keywords" , "MonetDBLite" ) ] ) names( x )[ names( x ) == j ] <- paste0( j , "_" )
-
-        # change dots for underscore
-        names( x ) <- gsub( "\\." , "_" , names( x ) )
-
-        # remove trailing spaces
-        names( x ) <- trimws( names( x ) , which = "both" )
-
-        # coerce factor columns to character
-        x[ sapply( x , class ) == "factor" ] <- sapply( x[ sapply( x , class ) == "factor" ] , as.character )
-
-        # figure out which columns really ought to be numeric
-        for( this_col in names( x ) ){
-
-          # if the column can be coerced without a warning, coerce it to numeric
-          this_result <- tryCatch( as.numeric( x[ , this_col ] ) , warning = function(c) NULL )
-
-          if( !is.null( this_result ) ) x[ , this_col ] <- as.numeric( x[ , this_col ] )
-
-        }
-
-        # remove accents and special characters from character columns
-        # figure out which columns really ought to be numeric
-        x[ , sapply( x, typeof ) == "character" ] <-
-          apply( x[ , sapply( x, typeof ) == "character" ] , 2 , function( column ) {
-            column = iconv( column , to = "ASCII//TRANSLIT" )
-            gsub( "\\{" , "" , column )
-          } )
-
-        catalog[ i , 'case_count' ] <- nrow( x )
-
-        saveRDS( x , file = catalog[ i , 'output_filename' ] )
-
-        these_cols <- sapply( x , class )
-
-        these_cols <- data.frame( col_name = names( these_cols ) , col_type = these_cols , stringsAsFactors = FALSE )
-
-        if( exists( catalog[ i , 'db_tablename' ] ) ) {
-
-          same_table_cols <- get( catalog[ i , 'db_tablename' ] )
-          same_table_cols <- unique( rbind( these_cols , same_table_cols ) )
-
-        } else same_table_cols <- these_cols
-
-        dupe_cols <- same_table_cols$col_name[ duplicated( same_table_cols$col_name ) ]
-
-        # if there's a duplicate, remove the numeric typed column
-        same_table_cols <- same_table_cols[ !( same_table_cols$col_type == 'numeric' & same_table_cols$col_name %in% dupe_cols ) , ]
-
-        assign( catalog[ i , 'db_tablename' ] , same_table_cols )
-
-        # process tracker
-        cat( paste0( data_name , " catalog entry " , i , " of " , nrow( catalog ) , " stored at '" , catalog[ i , 'output_filename' ] , "'\r\n\n" ) )
-
-        # if this is the final catalog entry for the unique db_tablename, then write them all to the database
-        if( i == max( which( catalog$db_tablename == catalog[ i , 'db_tablename' ] ) ) ){
-
-          correct_columns <- get( catalog[ i , 'db_tablename' ] )
-
-          # open the connection to the monetdblite database
-          db <- DBI::dbConnect( MonetDBLite::MonetDBLite() , catalog[ i , 'dbfolder' ] )
-
-          # loop through all tables that match the current db_tablename
-          for( this_file in catalog[ catalog$db_tablename %in% catalog[ i , 'db_tablename' ] , 'output_filename' ] ){
-
-            x <- readRDS( this_file )
-
-            for( this_col in setdiff( correct_columns$col_name , names( x ) ) ) x[ , this_col ] <- NA
-
-            # get final table types
-            same_table_cols <- get( catalog[ i , 'db_tablename' ] )
-
-            for( this_row in seq( nrow( same_table_cols ) ) ){
-
-              if( same_table_cols[ this_row , 'col_type' ] != class( x[ , same_table_cols[ this_row , 'col_name' ] ] ) ){
-
-                if( same_table_cols[ this_row , 'col_type' ] == 'numeric' ) x[ , same_table_cols[ this_row , 'col_name' ] ] <- as.numeric( x[ , same_table_cols[ this_row , 'col_name' ] ] )
-                if( same_table_cols[ this_row , 'col_type' ] == 'character' ) x[ , same_table_cols[ this_row , 'col_name' ] ] <- as.character( x[ , same_table_cols[ this_row , 'col_name' ] ] )
-
-              }
-
-            }
-
-            # put the columns of x in alphabetical order so they're always the same
-            x <- x[ sort( names( x ) ) ]
-
-            # re-save the file
-            saveRDS( x , file = this_file )
-
-            # append the file to the database
-            DBI::dbWriteTable( db , catalog[ i , 'db_tablename' ] , x , append = TRUE , row.names = FALSE )
-
-            file_index <- seq_along( catalog[ ( catalog[ i , 'db_tablename' ] == catalog$db_tablename ) & ! is.na( catalog$db_tablename ) , 'output_filename' ] ) [ this_file == catalog[ ( catalog[ i , 'db_tablename' ] == catalog$db_tablename ) & ! is.na( catalog$db_tablename ) , 'output_filename' ] ]
-            cat( "\r", paste0( data_name , " entry " , file_index , " of " , nrow( catalog[ catalog$db_tablename == catalog[ i , 'db_tablename' ] , ] ) , " stored at '" , catalog[ i , 'db_tablename' ] , "'\r" ) )
-
-          }
-
-          # disconnect from the current monet database
-          DBI::dbDisconnect( db , shutdown = TRUE )
-
-        }
-
+        file.remove( cleaned_data_file )
 
       }
 
-
-      # delete the temporary files
-      suppressWarnings( file.remove( tf ) )
+      cat( paste0( data_name , " catalog entry " , i , " of " , nrow( catalog ) , " stored\r\n\n" ) )
 
     }
+
+    # disconnect from the current monet database
+    DBI::dbDisconnect( db , shutdown = TRUE )
 
     catalog
 
   }
 
+standardize_mtps <-
+  function( infile ){
+
+    tf_a <- tempfile()
+
+    outcon <- file( tf_a , "w" )
+
+    incon <- file( infile , "r" )
+
+    # read file header
+    file.header <- strsplit( readLines( incon , 1 , warn = FALSE ) , ";" )[ 1 ] [[ 1 ]]
+
+    # convert file header to lowercase
+    file.header <- tolower( file.header )
+
+    # remove special characters
+    file.header <- iconv( file.header , "" , "ASCII//TRANSLIT" )
+
+    # remove trailing spaces
+    file.header <- trimws( file.header , which = "both" )
+
+    # add underscores after monetdb illegal names
+    for ( j in file.header [ toupper( file.header ) %in% getFromNamespace( "reserved_monetdb_keywords" , "MonetDBLite" ) ] ) file.header[ file.header == j ] <- paste0( j , "_" )
+
+    # change dots, spaces , hiphens and bars to underscore
+    file.header <- gsub( "\\.|/|-" , "_" , file.header )
+    file.header <- gsub( " " , "_" , file.header )
+
+    # create a standard csv line
+    first.line <- paste0( file.header , collapse = ";" )
+
+    # rewrite first line
+    writeLines( first.line , outcon )
+
+    while( length( line <- readLines( incon , 50000 , warn = FALSE ) ) > 0 ) writeLines( gsub( "\\{" ,  "" , iconv( line , "" , "ASCII//TRANSLIT" , sub = " " ) ) , outcon )
+
+    close( incon )
+
+    close( outcon )
+
+    tf_a
+  }
